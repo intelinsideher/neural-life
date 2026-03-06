@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Neural Life Simulation</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #1a1a1a;
+            color: #fff;
+            font-family: monospace;
+        }
+        #canvas {
+            border: 1px solid #333;
+            display: block;
+            margin: 20px auto;
+            background: #000;
+        }
+        .controls {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #2a2a2a;
+            border-radius: 8px;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 5px;
+            background: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        button:disabled {
+            background: #666;
+            cursor: not-allowed;
+        }
+        .slider-group {
+            margin: 15px 0;
+        }
+        label {
+            display: inline-block;
+            width: 200px;
+        }
+        input[type="range"] {
+            width: 200px;
+        }
+        .stats {
+            margin-top: 10px;
+            padding: 10px;
+            background: #333;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="controls">
+        <h1>Neural Life Simulation</h1>
+        <div>
+            <button id="startBtn">Start</button>
+            <button id="pauseBtn">Pause</button>
+            <button id="resetBtn">Reset</button>
+            <button id="randomizeBtn">Randomize</button>
+        </div>
+        
+        <div class="slider-group">
+            <label>Grid Size: <span id="gridSizeValue">50</span></label>
+            <input type="range" id="gridSize" min="20" max="100" value="50">
+        </div>
+        
+        <div class="slider-group">
+            <label>Learning Rate: <span id="learningRateValue">0.01</span></label>
+            <input type="range" id="learningRate" min="0.001" max="0.1" step="0.001" value="0.01">
+        </div>
+        
+        <div class="slider-group">
+            <label>Mutation Rate: <span id="mutationRateValue">0.05</span></label>
+            <input type="range" id="mutationRate" min="0.001" max="0.2" step="0.001" value="0.05">
+        </div>
+        
+        <div class="slider-group">
+            <label>Energy Decay: <span id="energyDecayValue">0.1</span></label>
+            <input type="range" id="energyDecay" min="0.01" max="0.5" step="0.01" value="0.1">
+        </div>
+        
+        <div class="stats" id="stats">
+            Generation: 0 | Living Cells: 0 | Avg Fitness: 0.00
+        </div>
+    </div>
+    
+    <canvas id="canvas" width="800" height="800"></canvas>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        
+        let gridSize = 50;
+        let cellSize = canvas.width / gridSize;
+        let grid = [];
+        let generation = 0;
+        let isRunning = false;
+        let animationId = null;
+        
+        // Neural network parameters
+        let learningRate = 0.01;
+        let mutationRate = 0.05;
+        let energyDecay = 0.1;
+        
+        // Cell class with neural network
+        class Cell {
+            constructor(x, y) {
+                this.x = x;
+                this.y = y;
+                this.alive = Math.random() > 0.5;
+                this.energy = this.alive ? 1.0 : 0.0;
+                this.age = 0;
+                this.fitness = 0;
+                
+                // Simple neural network weights
+                this.weights = {
+                    neighbors: Array(8).fill(0).map(() => Math.random() * 2 - 1),
+                    energy: Math.random() * 2 - 1,
+                    age: Math.random() * 2 - 1,
+                    bias: Math.random() * 2 - 1
+                };
+            }
+            
+            countNeighbors() {
+                let count = 0;
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dy = -1; dy <= 1; dy++) {
+                        if (dx === 0 && dy === 0) continue;
+                        const nx = (this.x + dx + gridSize) % gridSize;
+                        const ny = (this.y + dy + gridSize) % gridSize;
+                        if (grid[ny][nx].alive) count++;
+                    }
+                }
+                return count;
+            }
+            
+            getNeighborStates() {
+                const states = [];
+                for (let dx = -1; dx <= 1; dx++) {
+                    for (let dy = -1; dy <= 1; dy++) {
+                        if (dx === 0 && dy === 0) continue;
+                        const nx = (this.x + dx + gridSize) % gridSize;
+                        const ny = (this.y + dy + gridSize) % gridSize;
+                        states.push(grid[ny][nx].alive ? 1 : 0);
+                    }
+                }
+                return states;
+            }
+            
+            activate(x) {
+                // Sigmoid activation
+                return 1 / (1 + Math.exp(-x));
+            }
+            
+            neuralDecision() {
+                const neighborStates = this.getNeighborStates();
+                let sum = this.weights.bias;
+                
+                // Process neighbor inputs
+                for (let i = 0; i < 8; i++) {
+                    sum += neighborStates[i] * this.weights.neighbors[i];
+                }
+                
+                // Add energy and age factors
+                sum += this.energy * this.weights.energy;
+                sum += (this.age / 100) * this.weights.age;
+                
+                return this.activate(sum);
+            }
+            
+            update() {
+                if (this.alive) {
+                    this.age++;
+                    this.energy -= energyDecay;
+                    
+                    // Neural decision making
+                    const decision = this.neuralDecision();
+                    
+                    // Die if energy too low or decision is negative
+                    if (this.energy <= 0 || decision < 0.3) {
+                        this.alive = false;
+                        this.energy = 0;
+                        this.fitness = this.age;
+                    } else {
+                        // Reward for survival
+                        this.fitness += 0.1;
+                    }
+                } else {
+                    // Check for reproduction
+                    const neighbors = this.countNeighbors();
+                    if (neighbors >= 2 && neighbors <= 4) {
+                        const decision = this.neuralDecision();
+                        if (decision > 0.7) {
+                            this.alive = true;
+                            this.energy = 0.8;
+                            this.age = 0;
+                            this.mutate();
+                        }
+                    }
+                }
+            }
+            
+            mutate() {
+                if (Math.random() < mutationRate) {
+                    // Mutate a random weight
+                    const weightType = ['neighbors', 'energy', 'age', 'bias'][Math.floor(Math.random() * 4)];
+                    if (weightType === 'neighbors') {
+                        const idx = Math.floor(Math.random() * 8);
+                        this.weights.neighbors[idx] += (Math.random() * 2 - 1) * learningRate;
+                    } else {
+                        this.weights[weightType] += (Math.random() * 2 - 1) * learningRate;
+                    }
+                }
+            }
+            
+            draw() {
+                const px = this.x * cellSize;
+                const py = this.y * cellSize;
+                
+                if (this.alive) {
+                    // Color based on energy and age
+                    const energyColor = Math.floor(this.energy * 255);
+                    const ageColor = Math.min(255, this.age * 2);
+                    ctx.fillStyle = `rgb(${energyColor}, ${ageColor}, ${200})`;
+                } else {
+                    ctx.fillStyle = '#000';
+                }
+                
+                ctx.fillRect(px, py, cellSize - 1, cellSize - 1);
+            }
+        }
+        
+        function initGrid() {
+            grid = [];
+            for (let y = 0; y < gridSize; y++) {
+                grid[y] = [];
+                for (let x = 0; x < gridSize; x++) {
+                    grid[y][x] = new Cell(x, y);
+                }
+            }
+        }
+        
+        function updateGrid() {
+            // Create a copy for simultaneous updates
+            const newStates = grid.map(row => 
+                row.map(cell => {
+                    const newCell = Object.assign({}, cell);
+                    cell.update();
+                    return cell;
+                })
+            );
+            
+            grid = newStates;
+            generation++;
+        }
+        
+        function drawGrid() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            for (let y = 0; y < gridSize; y++) {
+                for (let x = 0; x < gridSize; x++) {
+                    grid[y][x].draw();
+                }
+            }
+        }
+        
+        function updateStats() {
+            let livingCells = 0;
+            let totalFitness = 0;
+            
+            for (let y = 0; y < gridSize; y++) {
+                for (let x = 0; x < gridSize; x++) {
+                    if (grid[y][x].alive) {
+                        livingCells++;
+                        totalFitness += grid[y][x].fitness;
+                    }
+                }
+            }
+            
+            const avgFitness = livingCells > 0 ? totalFitness / livingCells : 0;
+            document.getElementById('stats').textContent = 
+                `Generation: ${generation} | Living Cells: ${livingCells} | Avg Fitness: ${avgFitness.toFixed(2)}`;
+        }
+        
+        function animate() {
+            if (!isRunning) return;
+            
+            updateGrid();
+            drawGrid();
+            updateStats();
+            
+            animationId = requestAnimationFrame(animate);
+        }
+        
+        // Controls
+        document.getElementById('startBtn').addEventListener('click', () => {
+            isRunning = true;
+            animate();
+        });
+        
+        document.getElementById('pauseBtn').addEventListener('click', () => {
+            isRunning = false;
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+            }
+        });
+        
+        document.getElementById('resetBtn').addEventListener('click', () => {
+            isRunning = false;
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+            }
+            generation = 0;
+            initGrid();
+            drawGrid();
+            updateStats();
+        });
+        
+        document.getElementById('randomizeBtn').addEventListener('click', () => {
+            for (let y = 0; y < gridSize; y++) {
+                for (let x = 0; x < gridSize; x++) {
+                    grid[y][x].alive = Math.random() > 0.5;
+                    grid[y][x].energy = grid[y][x].alive ? Math.random() : 0;
+                }
+            }
+            drawGrid();
+            updateStats();
+        });
+        
+        // Sliders
+        document.getElementById('gridSize').addEventListener('input', (e) => {
+            const value = parseInt(e.target.value);
+            document.getElementById('gridSizeValue').textContent = value;
+            gridSize = value;
+            cellSize = canvas.width / gridSize;
+            initGrid();
+            drawGrid();
+        });
+        
+        document.getElementById('learningRate').addEventListener('input', (e) => {
+            learningRate = parseFloat(e.target.value);
+            document.getElementById('learningRateValue').textContent = learningRate.toFixed(3);
+        });
+        
+        document.getElementById('mutationRate').addEventListener('input', (e) => {
+            mutationRate = parseFloat(e.target.value);
+            document.getElementById('mutationRateValue').textContent = mutationRate.toFixed(3);
+        });
+        
+        document.getElementById('energyDecay').addEventListener('input', (e) => {
+            energyDecay = parseFloat(e.target.value);
+            document.getElementById('energyDecayValue').textContent = energyDecay.toFixed(2);
+        });
+        
+        // Initialize
+        initGrid();
+        drawGrid();
+        updateStats();
+    </script>
+</body>
+</html>

@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Neural Life Simulation - GPU Accelerated</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #1a1a1a;
+            color: #fff;
+            font-family: monospace;
+        }
+        #canvas {
+            border: 1px solid #333;
+            display: block;
+            margin: 20px auto;
+            background: #000;
+            image-rendering: pixelated;
+        }
+        .controls {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #2a2a2a;
+            border-radius: 8px;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 5px;
+            background: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        button:disabled {
+            background: #666;
+            cursor: not-allowed;
+        }
+        .slider-group {
+            margin: 15px 0;
+        }
+        label {
+            display: inline-block;
+            width: 200px;
+        }
+        input[type="range"] {
+            width: 200px;
+        }
+        .stats {
+            margin-top: 10px;
+            padding: 10px;
+            background: #333;
+            border-radius: 4px;
+        }
+        .warning {
+            color: #ff9800;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="controls">
+        <h1>Neural Life Simulation - GPU Accelerated</h1>
+        <div>
+            <button id="startBtn">Start</button>
+            <button id="pauseBtn">Pause</button>
+            <button id="resetBtn">Reset</button>
+            <button id="randomizeBtn">Randomize</button>
+        </div>
+        
+        <div class="slider-group">
+            <label>Grid Size: <span id="gridSizeValue">100</span></label>
+            <input type="range" id="gridSize" min="50" max="200" value="100">
+        </div>
+        
+        <div class="slider-group">
+            <label>Learning Rate: <span id="learningRateValue">0.01</span></label>
+            <input type="range" id="learningRate" min="0.001" max="0.1" step="0.001" value="0.01">
+        </div>
+        
+        <div class="slider-group">
+            <label>Mutation Rate: <span id="mutationRateValue">0.05</span></label>
+            <input type="range" id="mutationRate" min="0.001" max="0.2" step="0.001" value="0.05">
+        </div>
+        
+        <div class="slider-group">
+            <label>Energy Decay: <span id="energyDecayValue">0.1</span></label>
+            <input type="range" id="energyDecay" min="0.01" max="0.5" step="0.01" value="0.1">
+        </div>
+        
+        <div class="stats" id="stats">
+            Generation: 0 | Living Cells: 0 | Avg Fitness: 0.00 | FPS: 0
+        </div>
+        <div class="warning" id="warning"></div>
+    </div>
+    
+    <canvas id="canvas" width="800" height="800"></canvas>
+
+    <script>
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        
+        let gridSize = 100;
+        let cellSize = canvas.width / gridSize;
+        let generation = 0;
+        let isRunning = false;
+        let animationId = null;
+        let lastFrameTime = performance.now();
+        let fps = 0;
+        
+        // Neural network parameters
+        let learningRate = 0.01;
+        let mutationRate = 0.05;
+        let energyDecay = 0.1;
+        
+        // GPU-accelerated data structures using typed arrays
+        let cellStates = new Uint8Array(gridSize * gridSize); // alive/dead
+        let cellEnergy = new Float32Array(gridSize * gridSize);
+        let cellAge = new Uint32Array(gridSize * gridSize);
+        let cellFitness = new Float32Array(gridSize * gridSize);
+        
+        // Neural network weights (flattened for performance)
+        let weightsNeighbors = new Float32Array(gridSize * gridSize * 8);
+        let weightsEnergy = new Float32Array(gridSize * gridSize);
+        let weightsAge = new Float32Array(gridSize * gridSize);
+        let weightsBias = new Float32Array(gridSize * gridSize);
+        
+        // Image data for rendering
+        let imageData = ctx.createImageData(canvas.width, canvas.height);
+        
+        function initGrid() {
+            const totalCells = gridSize * gridSize;
+            
+            for (let i = 0; i < totalCells; i++) {
+                cellStates[i] = Math.random() > 0.5 ? 1 : 0;
+                cellEnergy[i] = cellStates[i] ? 1.0 : 0.0;
+                cellAge[i] = 0;
+                cellFitness[i] = 0;
+                
+                // Initialize random weights
+                for (let j = 0; j < 8; j++) {
+                    weightsNeighbors[i * 8 + j] = Math.random() * 2 - 1;
+                }
+                weightsEnergy[i] = Math.random() * 2 - 1;
+                weightsAge[i] = Math.random() * 2 - 1;
+                weightsBias[i] = Math.random() * 2 - 1;
+            }
+        }
+        
+        function sigmoid(x) {
+            return 1 / (1 + Math.exp(-x));
+        }
+        
+        function getIndex(x, y) {
+            return y * gridSize + x;
+        }
+        
+        function countNeighbors(x, y) {
+            let count = 0;
+            const offsets = [
+                [-1, -1], [0, -1], [1, -1],
+                [-1, 0],           [1, 0],
+                [-1, 1],  [0, 1],  [1, 1]
+            ];
+            
+            for (const [dx, dy] of offsets) {
+                const nx = (x + dx + gridSize) % gridSize;
+                const ny = (y + dy + gridSize) % gridSize;
+                count += cellStates[getIndex(nx, ny)];
+            }
+            return count;
+        }
+        
+        function getNeighborStates(x, y, states) {
+            const offsets = [
+                [-1, -1], [0, -1], [1, -1],
+                [-1, 0],           [1, 0],
+                [-1, 1],  [0, 1],  [1, 1]
+            ];
+            
+            for (let i = 0; i < 8; i++) {
+                const [dx, dy] = offsets[i];
+                const nx = (x + dx + gridSize) % gridSize;
+                const ny = (y + dy + gridSize) % gridSize;
+                states[i] = cellStates[getIndex(nx, ny)];
+            }
+        }
+        
+        function neuralDecision(idx, neighborStates) {
+            let sum = weightsBias[idx];
+            
+            // Process neighbor inputs
+            for (let i = 0; i < 8; i++) {
+                sum += neighborStates[i] * weightsNeighbors[idx * 8 + i];
+            }
+            
+            // Add energy and age factors
+            sum += cellEnergy[idx] * weightsEnergy[idx];
+            sum += (cellAge[idx] / 100) * weightsAge[idx];
+            
+            return sigmoid(sum);
+        }
+        
+        function mutate(idx) {
+            if (Math.random() < mutationRate) {
+                const weightType = Math.floor(Math.random() * 4);
+                const delta = (Math.random() * 2 - 1) * learningRate;
+                
+                switch (weightType) {
+                    case 0: // neighbors
+                        const neighborIdx = Math.floor(Math.random() * 8);
+                        weightsNeighbors[idx * 8 + neighborIdx] += delta;
+                        break;
+                    case 1:
+                        weightsEnergy[idx] += delta;
+                        break;
+                    case 2:
+                        weightsAge[idx] += delta;
+                        break;
+                    case 3:
+                        weightsBias[idx] += delta;
+                        break;
+                }
+            }
+        }
+        
+        function updateGrid() {
+            // Create temporary arrays for simultaneous updates
+            const newStates = new Uint8Array(cellStates);
+            const newEnergy = new Float32Array(cellEnergy);
+            const newAge = new Uint32Array(cellAge);
+            const neighborStates = new Uint8Array(8);
+            
+            for (let y = 0; y < gridSize; y++) {
+                for (let x = 0; x < gridSize; x++) {
+                    const idx = getIndex(x, y);
+                    
+                    if (cellStates[idx] === 1) {
+                        // Living cell
+                        newAge[idx] = cellAge[idx] + 1;
+                        newEnergy[idx] = cellEnergy[idx] - energyDecay;
+                        
+                        // Get neural decision
+                        getNeighborStates(x, y, neighborStates);
+                        const decision = neuralDecision(idx, neighborStates);
+                        
+                        // Die if energy too low or decision is negative
+                        if (newEnergy[idx] <= 0 || decision < 0.3) {
+                            newStates[idx] = 0;
+                            newEnergy[idx] = 0;
+                            cellFitness[idx] = cellAge[idx];
+                        } else {
+                            // Reward for survival
+                            cellFitness[idx] += 0.1;
+                        }
+                    } else {
+                        // Dead cell - check for reproduction
+                        const neighbors = countNeighbors(x, y);
+                        if (neighbors >= 2 && neighbors <= 4) {
+                            getNeighborStates(x, y, neighborStates);
+                            const decision = neuralDecision(idx, neighborStates);
+                            
+                            if (decision > 0.7) {
+                                newStates[idx] = 1;
+                                newEnergy[idx] = 0.8;
+                                newAge[idx] = 0;
+                                mutate(idx);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Copy new states back
+            cellStates.set(newStates);
+            cellEnergy.set(newEnergy);
+            cellAge.set(newAge);
+            generation++;
+        }
+        
+        function drawGrid() {
+            const data = imageData.data;
+            
+            for (let y = 0; y < gridSize; y++) {
+                for (let x = 0; x < gridSize; x++) {
+                    const idx = getIndex(x, y);
+                    
+                    // Calculate pixel positions
+                    const startX = Math.floor(x * cellSize);
+                    const startY = Math.floor(y * cellSize);
+                    const endX = Math.floor((x + 1) * cellSize);
+                    const endY = Math.floor((y + 1) * cellSize);
+                    
+                    let r, g, b;
+                    if (cellStates[idx] === 1) {
+                        // Color based on energy and age
+                        r = Math.floor(cellEnergy[idx] * 255);
+                        g = Math.min(255, cellAge[idx] * 2);
+                        b = 200;
+                    } else {
+                        r = g = b = 0;
+                    }
+                    
+                    // Fill the cell in the image data
+                    for (let py = startY; py < endY; py++) {
+                        for (let px = startX; px < endX; px++) {
+                            const pixelIdx = (py * canvas.width + px) * 4;
+                            data[pixelIdx] = r;
+                            data[pixelIdx + 1] = g;
+                            data[pixelIdx + 2] = b;
+                            data[pixelIdx + 3] = 255;
+                        }
+                    }
+                }
+            }
+            
+            ctx.putImageData(imageData, 0, 0);
+        }
+        
+        function updateStats() {
+            let livingCells = 0;
+            let totalFitness = 0;
+            
+            for (let i = 0; i < cellStates.length; i++) {
+                if (cellStates[i] === 1) {
+                    livingCells++;
+                    totalFitness += cellFitness[i];
+                }
+            }
+            
+            const avgFitness = livingCells > 0 ? totalFitness / livingCells : 0;
+            document.getElementById('stats').textContent = 
+                `Generation: ${generation} | Living Cells: ${livingCells} | Avg Fitness: ${avgFitness.toFixed(2)} | FPS: ${fps}`;
+        }
+        
+        function animate() {
+            if (!isRunning) return;
+            
+            const currentTime = performance.now();
+            const deltaTime = currentTime - lastFrameTime;
+            fps = Math.round(1000 / deltaTime);
+            lastFrameTime = currentTime;
+            
+            updateGrid();
+            drawGrid();
+            updateStats();
+            
+            animationId = requestAnimationFrame(animate);
+        }
+        
+        // Controls
+        document.getElementById('startBtn').addEventListener('click', () => {
+            isRunning = true;
+            animate();
+        });
+        
+        document.getElementById('pauseBtn').addEventListener('click', () => {
+            isRunning = false;
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+            }
+        });
+        
+        document.getElementById('resetBtn').addEventListener('click', () => {
+            isRunning = false;
+            if (animationId) {
+                cancelAnimationFrame(animationId);
+            }
+            generation = 0;
+            initGrid();
+            drawGrid();
+            updateStats();
+        });
+        
+        document.getElementById('randomizeBtn').addEventListener('click', () => {
+            for (let i = 0; i < cellStates.length; i++) {
+                cellStates[i] = Math.random() > 0.5 ? 1 : 0;
+                cellEnergy[i] = cellStates[i] ? Math.random() : 0;
+            }
+            drawGrid();
+            updateStats();
+        });
+        
+        // Sliders
+        document.getElementById('gridSize').addEventListener('input', (e) => {
+            const value = parseInt(e.target.value);
+            document.getElementById('gridSizeValue').textContent = value;
+            
+            if (isRunning) {
+                document.getElementById('warning').textContent = 'Please pause before changing grid size';
+                return;
+            }
+            
+            gridSize = value;
+            cellSize = canvas.width / gridSize;
+            
+            // Reinitialize arrays
+            const totalCells = gridSize * gridSize;
+            cellStates = new Uint8Array(totalCells);
+            cellEnergy = new Float32Array(totalCells);
+            cellAge = new Uint32Array(totalCells);
+            cellFitness = new Float32Array(totalCells);
+            weightsNeighbors = new Float32Array(totalCells * 8);
+            weightsEnergy = new Float32Array(totalCells);
+            weightsAge = new Float32Array(totalCells);
+            weightsBias = new Float32Array(totalCells);
+            imageData = ctx.createImageData(canvas.width, canvas.height);
+            
+            initGrid();
+            drawGrid();
+            document.getElementById('warning').textContent = '';
+        });
+        
+        document.getElementById('learningRate').addEventListener('input', (e) => {
+            learningRate = parseFloat(e.target.value);
+            document.getElementById('learningRateValue').textContent = learningRate.toFixed(3);
+        });
+        
+        document.getElementById('mutationRate').addEventListener('input', (e) => {
+            mutationRate = parseFloat(e.target.value);
+            document.getElementById('mutationRateValue').textContent = mutationRate.toFixed(3);
+        });
+        
+        document.getElementById('energyDecay').addEventListener('input', (e) => {
+            energyDecay = parseFloat(e.target.value);
+            document.getElementById('energyDecayValue').textContent = energyDecay.toFixed(2);
+        });
+        
+        // Initialize
+        initGrid();
+        drawGrid();
+        updateStats();
+    </script>
+</body>
+</html>
